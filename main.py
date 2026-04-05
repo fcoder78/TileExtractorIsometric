@@ -15,30 +15,213 @@ TILE_WIDTH = 512
 TILE_HEIGHT = 256
 
 MIN_TILE_AREA = 12000
-REPROCESS_ONLY = False  # 🔥 set True to only reprocess using overrides
+REPROCESS_ONLY = False  # True = only apply anchor overrides to existing exports
+
+# Background / mask tuning
+BORDER_THICKNESS = 16
+BG_DISTANCE_THRESHOLD = 18
+MORPH_KERNEL_SIZE = 5
+MAX_COMPONENT_GAP_FILL = 3
+
+# Export tuning
+MIN_CANVAS_HEIGHT = 420
+EXTRA_CANVAS_PADDING = 40
+
+# Contact sheet
+CONTACT_SHEET_COLS = 4
+THUMB_W = 256
+THUMB_H = 256
+
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def get_mask(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
-    _, mask = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    return mask
+def ensure_rgba(img):
+    if img is None:
+        return None
+    if len(img.shape) == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+    if img.shape[2] == 3:
+        return cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    return img
 
-def find_tiles(mask):
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return [c for c in contours if cv2.contourArea(c) > MIN_TILE_AREA]
+
+def sample_border_pixels(img_bgr, border_thickness):
+    h, w = img_bgr.shape[:2]
+    t = min(border_thickness, h // 4, w // 4)
+
+    top = img_bgr[:t, :, :].reshape(-1, 3)
+    bottom = img_bgr[h - t:h, :, :].reshape(-1, 3)
+    left = img_bgr[:, :t, :].reshape(-1, 3)
+    right = img_bgr[:, w - t:w, :].reshape(-1, 3)
+
+    return np.vstack([top, bottom, left, right])
+
+
+def estimate_background_color(img_bgr):
+    border_pixels = sample_border_pixels(img_bgr, BORDER_THICKNESS)
+    return np.median(border_pixels, axis=0).astype(np.uint8)
+
+
+def build_foreground_mask(img):
+    """
+    Build a foreground mask by comparing every pixel to the estimated
+    background color from the image borders.
+    """
+    bgr = img[:, :, :3]
+    bg_color = estimate_background_color(bgr)
+
+    # Use LAB color space for better perceptual distance
+    img_lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    bg_patch = np.full((1, 1, 3), bg_color, dtype=np.uint8)
+    bg_lab = cv2.cvtColor(bg_patch, cv2.COLOR_BGR2LAB)[0, 0].astype(np.int16)
+
+    diff = img_lab.astype(np.int16) - bg_lab
+    dist = np.sqrt(np.sum(diff * diff, axis=2)).astype(np.float32)
+
+    mask = np.zeros(dist.shape, dtype=np.uint8)
+    mask[dist >= BG_DISTANCE_THRESHOLD] = 255
+
+    # Morphological cleanup
+    k = np.ones((MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+
+    # Small horizontal/vertical closing to reconnect tiny gaps
+    if MAX_COMPONENT_GAP_FILL > 0:
+        kx = np.ones((1, MAX_COMPONENT_GAP_FILL), np.uint8)
+        ky = np.ones((MAX_COMPONENT_GAP_FILL, 1), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kx)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ky)
+
+    return mask, bg_color
+
+
+def find_components(mask):
+    """
+    Return bounding boxes and masks for connected components larger than MIN_TILE_AREA.
+    """
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+    components = []
+    for label in range(1, num_labels):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+
+        if area < MIN_TILE_AREA:
+            continue
+
+        component_mask = np.zeros((h, w), dtype=np.uint8)
+        component_mask[labels[y:y + h, x:x + w] == label] = 255
+
+        components.append({
+            "bbox": [x, y, w, h],
+            "area": area,
+            "mask": component_mask
+        })
+
+    return sort_components_reading_order(components)
+
+
+def sort_components_reading_order(components):
+    """
+    Sort roughly top-to-bottom, then left-to-right.
+    """
+    if not components:
+        return components
+
+    # Estimate a row bucket based on average object height
+    avg_h = int(np.mean([c["bbox"][3] for c in components]))
+    row_bucket = max(80, avg_h // 2)
+
+    return sorted(
+        components,
+        key=lambda c: (c["bbox"][1] // row_bucket, c["bbox"][0])
+    )
+
 
 def estimate_anchor(mask):
+    """
+    Estimate anchor as the lowest occupied row's horizontal center.
+    This is still heuristic, but far better once the mask is correct.
+    """
     h, w = mask.shape
-    for y in range(h - 1, 0, -1):
+    for y in range(h - 1, -1, -1):
         xs = np.where(mask[y] > 0)[0]
         if len(xs) > 0:
-            return int((xs[0] + xs[-1]) / 2), y
+            return int((xs[0] + xs[-1]) / 2), int(y)
     return w // 2, h - 1
+
+
+def save_mask_debug(mask, output_path):
+    Image.fromarray(mask).save(output_path)
+
+
+def save_components_debug(img, components, output_path):
+    dbg = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2RGB)
+    dbg = Image.fromarray(dbg)
+    draw = ImageDraw.Draw(dbg)
+
+    for i, comp in enumerate(components):
+        x, y, w, h = comp["bbox"]
+        draw.rectangle([x, y, x + w, y + h], outline=(255, 0, 0), width=3)
+        draw.text((x + 4, y + 4), f"{i:03d}", fill=(255, 255, 0))
+
+    dbg.save(output_path)
+
+
+def create_rgba_crop(img, bbox, local_mask):
+    x, y, w, h = bbox
+    crop = img[y:y + h, x:x + w].copy()
+
+    rgba = cv2.cvtColor(crop, cv2.COLOR_BGRA2RGBA)
+    pil_img = Image.fromarray(rgba)
+    pil_img.putalpha(Image.fromarray(local_mask))
+    return pil_img
+
+
+def create_contact_sheet(metadata, output_dir, debug_dir):
+    if not metadata:
+        return
+
+    cols = CONTACT_SHEET_COLS
+    rows = int(np.ceil(len(metadata) / cols))
+
+    sheet = Image.new(
+        "RGBA",
+        (cols * THUMB_W, rows * THUMB_H),
+        (30, 30, 30, 255)
+    )
+    draw = ImageDraw.Draw(sheet)
+
+    for i, item in enumerate(metadata):
+        path = os.path.join(output_dir, item["file"])
+        if not os.path.exists(path):
+            continue
+
+        img = Image.open(path).convert("RGBA")
+        thumb = img.resize((THUMB_W, THUMB_H), Image.Resampling.LANCZOS)
+
+        x = (i % cols) * THUMB_W
+        y = (i // cols) * THUMB_H
+
+        sheet.paste(thumb, (x, y), thumb)
+        draw.text((x + 6, y + 6), item["id"], fill=(255, 255, 0))
+
+        # Draw target anchor position, not estimated source anchor
+        ax = THUMB_W // 2
+        ay = int((TILE_HEIGHT / max(img.height, 1)) * THUMB_H)
+
+        draw.line((x + ax - 6, y + ay, x + ax + 6, y + ay), fill="red", width=2)
+        draw.line((x + ax, y + ay - 6, x + ax, y + ay + 6), fill="red", width=2)
+
+    sheet.save(os.path.join(debug_dir, "contact_sheet.png"))
+    print("[INFO] Contact sheet generated")
+
 
 # ============================================================
 # CORE PROCESSING
@@ -47,65 +230,52 @@ def estimate_anchor(mask):
 def process_image(image_path):
     image_name = os.path.splitext(os.path.basename(image_path))[0]
 
-    OUTPUT_DIR = os.path.join(OUTPUT_ROOT, image_name)
-    DEBUG_DIR = os.path.join(OUTPUT_DIR, "_debug")
+    output_dir = os.path.join(OUTPUT_ROOT, image_name)
+    debug_dir = os.path.join(output_dir, "_debug")
 
-    META_FILE = os.path.join(OUTPUT_DIR, "metadata.json")
-    ANCHOR_OVERRIDE_FILE = os.path.join(OUTPUT_DIR, "anchors_override.json")
+    meta_file = os.path.join(output_dir, "metadata.json")
+    anchor_override_file = os.path.join(output_dir, "anchors_override.json")
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.makedirs(DEBUG_DIR, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(debug_dir, exist_ok=True)
 
     print(f"\n[PROCESSING] {image_name}")
 
-    if REPROCESS_ONLY and os.path.exists(META_FILE):
-        with open(META_FILE) as f:
+    if REPROCESS_ONLY and os.path.exists(meta_file):
+        with open(meta_file, "r", encoding="utf-8") as f:
             metadata = json.load(f)
-        reprocess(metadata, OUTPUT_DIR, ANCHOR_OVERRIDE_FILE)
-        create_contact_sheet(metadata, OUTPUT_DIR, DEBUG_DIR)
+        reprocess(metadata, output_dir, anchor_override_file)
+        create_contact_sheet(metadata, output_dir, debug_dir)
         return
 
-    # =========================
-    # LOAD IMAGE
-    # =========================
     img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    img = ensure_rgba(img)
+
     if img is None:
         print(f"[ERROR] Failed to load {image_path}")
         return
 
-    if img.shape[2] == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    mask, bg_color = build_foreground_mask(img)
+    components = find_components(mask)
 
-    # =========================
-    # DETECT TILES
-    # =========================
-    mask = get_mask(img)
-    contours = find_tiles(mask)
+    print(f"[INFO] Estimated background color: {bg_color.tolist()}")
+    print(f"[INFO] Detected components: {len(components)}")
+
+    save_mask_debug(mask, os.path.join(debug_dir, "mask.png"))
+    save_components_debug(img, components, os.path.join(debug_dir, "components.png"))
 
     metadata = []
 
-    # =========================
-    # PROCESS EACH TILE
-    # =========================
-    for i, cnt in enumerate(contours):
-        x, y, w, h = cv2.boundingRect(cnt)
-
-        crop = img[y:y+h, x:x+w]
-        local_mask = np.zeros((h, w), dtype=np.uint8)
-
-        shifted = cnt.copy()
-        shifted[:, :, 0] -= x
-        shifted[:, :, 1] -= y
-
-        cv2.drawContours(local_mask, [shifted], -1, 255, -1)
+    for i, comp in enumerate(components):
+        x, y, w, h = comp["bbox"]
+        local_mask = comp["mask"]
 
         anchor_x, anchor_y = estimate_anchor(local_mask)
 
-        canvas_h = max(420, h + 40)
-        canvas = Image.new("RGBA", (TILE_WIDTH, canvas_h), (0, 0, 0, 0))
+        tile_img = create_rgba_crop(img, comp["bbox"], local_mask)
 
-        tile_img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGRA2RGBA))
-        tile_img.putalpha(Image.fromarray(local_mask))
+        canvas_h = max(MIN_CANVAS_HEIGHT, h + EXTRA_CANVAS_PADDING)
+        canvas = Image.new("RGBA", (TILE_WIDTH, canvas_h), (0, 0, 0, 0))
 
         paste_x = (TILE_WIDTH // 2) - anchor_x
         paste_y = TILE_HEIGHT - anchor_y
@@ -113,30 +283,28 @@ def process_image(image_path):
         canvas.paste(tile_img, (paste_x, paste_y), tile_img)
 
         name = f"object_{i:03d}.png"
-        canvas.save(os.path.join(OUTPUT_DIR, name))
+        save_path = os.path.join(output_dir, name)
+        canvas.save(save_path)
 
         metadata.append({
             "id": f"object_{i:03d}",
             "file": name,
             "bbox": [int(x), int(y), int(w), int(h)],
+            "area": int(comp["area"]),
             "anchor": [int(anchor_x), int(anchor_y)],
             "paste": [int(paste_x), int(paste_y)]
         })
 
-        print(f"[OK] {name}")
+        print(f"[OK] {name} bbox=({x}, {y}, {w}, {h}) area={comp['area']}")
 
-    # =========================
-    # SAVE METADATA
-    # =========================
-    with open(META_FILE, "w") as f:
+    with open(meta_file, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
-    if not os.path.exists(ANCHOR_OVERRIDE_FILE):
-        with open(ANCHOR_OVERRIDE_FILE, "w") as f:
+    if not os.path.exists(anchor_override_file):
+        with open(anchor_override_file, "w", encoding="utf-8") as f:
             json.dump({}, f, indent=2)
 
-    create_contact_sheet(metadata, OUTPUT_DIR, DEBUG_DIR)
-
+    create_contact_sheet(metadata, output_dir, debug_dir)
     print(f"[DONE] {image_name}")
 
 
@@ -144,19 +312,25 @@ def process_image(image_path):
 # REPROCESS (WITH OVERRIDES)
 # ============================================================
 
-def reprocess(metadata, OUTPUT_DIR, ANCHOR_OVERRIDE_FILE):
-    with open(ANCHOR_OVERRIDE_FILE) as f:
-        overrides = json.load(f)
+def reprocess(metadata, output_dir, anchor_override_file):
+    if os.path.exists(anchor_override_file):
+        with open(anchor_override_file, "r", encoding="utf-8") as f:
+            overrides = json.load(f)
+    else:
+        overrides = {}
 
     for item in metadata:
-        path = os.path.join(OUTPUT_DIR, item["file"])
+        path = os.path.join(output_dir, item["file"])
+        if not os.path.exists(path):
+            continue
+
         img = Image.open(path).convert("RGBA")
 
         anchor_x, anchor_y = item["anchor"]
 
         if item["id"] in overrides:
-            anchor_x = overrides[item["id"]]["anchor_x"]
-            anchor_y = overrides[item["id"]]["anchor_y"]
+            anchor_x = overrides[item["id"]].get("anchor_x", anchor_x)
+            anchor_y = overrides[item["id"]].get("anchor_y", anchor_y)
 
         canvas = Image.new("RGBA", (TILE_WIDTH, img.height), (0, 0, 0, 0))
 
@@ -170,45 +344,10 @@ def reprocess(metadata, OUTPUT_DIR, ANCHOR_OVERRIDE_FILE):
 
 
 # ============================================================
-# CONTACT SHEET
-# ============================================================
-
-def create_contact_sheet(metadata, OUTPUT_DIR, DEBUG_DIR):
-    cols = 4
-    rows = int(np.ceil(len(metadata) / cols))
-
-    thumb_w = 256
-    thumb_h = 256
-
-    sheet = Image.new("RGBA", (cols * thumb_w, rows * thumb_h), (30, 30, 30, 255))
-    draw = ImageDraw.Draw(sheet)
-
-    for i, item in enumerate(metadata):
-        img = Image.open(os.path.join(OUTPUT_DIR, item["file"])).resize((thumb_w, thumb_h))
-
-        x = (i % cols) * thumb_w
-        y = (i // cols) * thumb_h
-
-        sheet.paste(img, (x, y), img)
-
-        draw.text((x + 5, y + 5), item["id"], fill=(255, 255, 0))
-
-        ax = thumb_w // 2
-        ay = int((TILE_HEIGHT / img.height) * thumb_h)
-
-        draw.line((x + ax - 5, y + ay, x + ax + 5, y + ay), fill="red", width=2)
-        draw.line((x + ax, y + ay - 5, x + ax, y + ay + 5), fill="red", width=2)
-
-    sheet.save(os.path.join(DEBUG_DIR, "contact_sheet.png"))
-    print("[INFO] Contact sheet generated")
-
-
-# ============================================================
 # MAIN
 # ============================================================
 
 def main():
-    # Ensure input folder exists
     if not os.path.exists(INPUT_DIR):
         os.makedirs(INPUT_DIR)
         print(f"[INFO] Created '{INPUT_DIR}' folder. Put your images there and run again.")
