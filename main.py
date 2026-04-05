@@ -208,6 +208,12 @@ def create_contact_sheet(metadata, OUTPUT_DIR, DEBUG_DIR):
 # ============================================================
 
 def main():
+    # Ensure input folder exists
+    if not os.path.exists(INPUT_DIR):
+        os.makedirs(INPUT_DIR)
+        print(f"[INFO] Created '{INPUT_DIR}' folder. Put your images there and run again.")
+        return
+
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
     files = [
@@ -216,7 +222,8 @@ def main():
     ]
 
     if not files:
-        print("[ERROR] No images found in input/")
+        print("[WARNING] No images found in 'input/' folder.")
+        print("Add images and run again.")
         return
 
     for file in files:
