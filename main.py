@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw
 INPUT_DIR = "input"
 OUTPUT_ROOT = "output"
 
+# Logical isometric tile size used by your engine math
 TILE_WIDTH = 512
 TILE_HEIGHT = 256
 
@@ -22,9 +23,11 @@ BORDER_THICKNESS = 16
 BG_DISTANCE_THRESHOLD = 18
 MORPH_KERNEL_SIZE = 3
 MAX_COMPONENT_GAP_FILL = 3
-COMPONENT_PADDING = 16
+COMPONENT_PADDING = 24
 
 # Export tuning
+EXPORT_ANCHOR_X = TILE_WIDTH // 2
+EXPORT_ANCHOR_Y = 340   # IMPORTANT: lower than TILE_HEIGHT to preserve tall tops
 MIN_CANVAS_HEIGHT = 420
 EXTRA_CANVAS_PADDING = 40
 
@@ -73,7 +76,6 @@ def build_foreground_mask(img):
     bgr = img[:, :, :3]
     bg_color = estimate_background_color(bgr)
 
-    # Use LAB color space for better perceptual distance
     img_lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     bg_patch = np.full((1, 1, 3), bg_color, dtype=np.uint8)
     bg_lab = cv2.cvtColor(bg_patch, cv2.COLOR_BGR2LAB)[0, 0].astype(np.int16)
@@ -88,7 +90,6 @@ def build_foreground_mask(img):
     k = np.ones((MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
 
-    # Small horizontal/vertical closing to reconnect tiny gaps
     if MAX_COMPONENT_GAP_FILL > 0:
         kx = np.ones((1, MAX_COMPONENT_GAP_FILL), np.uint8)
         ky = np.ones((MAX_COMPONENT_GAP_FILL, 1), np.uint8)
@@ -102,7 +103,6 @@ def find_components(mask):
     """
     Return padded bounding boxes and masks for connected components
     larger than MIN_TILE_AREA.
-    Padding prevents tops/edges from getting clipped.
     """
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     img_h, img_w = mask.shape
@@ -118,7 +118,6 @@ def find_components(mask):
         if area < MIN_TILE_AREA:
             continue
 
-        # Expand bounding box
         x0 = max(0, x - COMPONENT_PADDING)
         y0 = max(0, y - COMPONENT_PADDING)
         x1 = min(img_w, x + w + COMPONENT_PADDING)
@@ -141,9 +140,6 @@ def find_components(mask):
 
 
 def sort_components_reading_order(components):
-    """
-    Sort roughly top-to-bottom, then left-to-right.
-    """
     if not components:
         return components
 
@@ -195,6 +191,36 @@ def create_rgba_crop(img, bbox, local_mask):
     return pil_img
 
 
+def normalize_tile_to_canvas(tile_img, local_mask, anchor_x, anchor_y):
+    """
+    Build a canvas that guarantees no clipping above or below the anchor.
+    """
+    h, w = local_mask.shape
+
+    above_anchor = anchor_y
+    below_anchor = h - anchor_y - 1
+
+    required_top = max(EXPORT_ANCHOR_Y, above_anchor + EXTRA_CANVAS_PADDING)
+    required_bottom = max(0, below_anchor + EXTRA_CANVAS_PADDING)
+
+    canvas_h = max(
+        MIN_CANVAS_HEIGHT,
+        required_top + required_bottom + 1
+    )
+
+    # Actual anchor location inside exported PNG
+    anchor_in_canvas_x = EXPORT_ANCHOR_X
+    anchor_in_canvas_y = required_top
+
+    paste_x = anchor_in_canvas_x - anchor_x
+    paste_y = anchor_in_canvas_y - anchor_y
+
+    canvas = Image.new("RGBA", (TILE_WIDTH, canvas_h), (0, 0, 0, 0))
+    canvas.paste(tile_img, (paste_x, paste_y), tile_img)
+
+    return canvas, paste_x, paste_y, anchor_in_canvas_x, anchor_in_canvas_y
+
+
 def create_contact_sheet(metadata, output_dir, debug_dir):
     if not metadata:
         return
@@ -223,8 +249,11 @@ def create_contact_sheet(metadata, output_dir, debug_dir):
         sheet.paste(thumb, (x, y), thumb)
         draw.text((x + 6, y + 6), item["id"], fill=(255, 255, 0))
 
-        ax = THUMB_W // 2
-        ay = int((TILE_HEIGHT / max(img.height, 1)) * THUMB_H)
+        anchor_canvas_x = item["export_anchor"][0]
+        anchor_canvas_y = item["export_anchor"][1]
+
+        ax = int((anchor_canvas_x / max(img.width, 1)) * THUMB_W)
+        ay = int((anchor_canvas_y / max(img.height, 1)) * THUMB_H)
 
         draw.line((x + ax - 6, y + ay, x + ax + 6, y + ay), fill="red", width=2)
         draw.line((x + ax, y + ay - 6, x + ax, y + ay + 6), fill="red", width=2)
@@ -283,13 +312,9 @@ def process_image(image_path):
         anchor_x, anchor_y = estimate_anchor(local_mask)
         tile_img = create_rgba_crop(img, comp["bbox"], local_mask)
 
-        canvas_h = max(MIN_CANVAS_HEIGHT, h + EXTRA_CANVAS_PADDING)
-        canvas = Image.new("RGBA", (TILE_WIDTH, canvas_h), (0, 0, 0, 0))
-
-        paste_x = (TILE_WIDTH // 2) - anchor_x
-        paste_y = TILE_HEIGHT - anchor_y
-
-        canvas.paste(tile_img, (paste_x, paste_y), tile_img)
+        canvas, paste_x, paste_y, export_anchor_x, export_anchor_y = normalize_tile_to_canvas(
+            tile_img, local_mask, anchor_x, anchor_y
+        )
 
         name = f"object_{i:03d}.png"
         save_path = os.path.join(output_dir, name)
@@ -300,11 +325,16 @@ def process_image(image_path):
             "file": name,
             "bbox": [int(x), int(y), int(w), int(h)],
             "area": int(comp["area"]),
-            "anchor": [int(anchor_x), int(anchor_y)],
-            "paste": [int(paste_x), int(paste_y)]
+            "source_anchor": [int(anchor_x), int(anchor_y)],
+            "paste": [int(paste_x), int(paste_y)],
+            "export_anchor": [int(export_anchor_x), int(export_anchor_y)],
+            "logical_tile_size": [int(TILE_WIDTH), int(TILE_HEIGHT)]
         })
 
-        print(f"[OK] {name} bbox=({x}, {y}, {w}, {h}) area={comp['area']}")
+        print(
+            f"[OK] {name} bbox=({x}, {y}, {w}, {h}) "
+            f"area={comp['area']} export_anchor=({export_anchor_x}, {export_anchor_y})"
+        )
 
     with open(meta_file, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -335,18 +365,28 @@ def reprocess(metadata, output_dir, anchor_override_file):
 
         img = Image.open(path).convert("RGBA")
 
-        anchor_x, anchor_y = item["anchor"]
+        export_anchor_x, export_anchor_y = item.get(
+            "export_anchor",
+            [EXPORT_ANCHOR_X, EXPORT_ANCHOR_Y]
+        )
 
         if item["id"] in overrides:
-            anchor_x = overrides[item["id"]].get("anchor_x", anchor_x)
-            anchor_y = overrides[item["id"]].get("anchor_y", anchor_y)
+            export_anchor_x = overrides[item["id"]].get("anchor_x", export_anchor_x)
+            export_anchor_y = overrides[item["id"]].get("anchor_y", export_anchor_y)
 
-        canvas = Image.new("RGBA", (TILE_WIDTH, img.height), (0, 0, 0, 0))
+        item["export_anchor"] = [int(export_anchor_x), int(export_anchor_y)]
 
-        paste_x = (TILE_WIDTH // 2) - anchor_x
-        paste_y = TILE_HEIGHT - anchor_y
+        img_w, img_h = img.size
+        new_canvas_h = max(img_h, export_anchor_y + EXTRA_CANVAS_PADDING)
+        canvas = Image.new("RGBA", (TILE_WIDTH, new_canvas_h), (0, 0, 0, 0))
 
-        canvas.paste(img, (paste_x, paste_y), img)
+        current_anchor_x = item.get("export_anchor", [EXPORT_ANCHOR_X, EXPORT_ANCHOR_Y])[0]
+        current_anchor_y = item.get("export_anchor", [EXPORT_ANCHOR_X, EXPORT_ANCHOR_Y])[1]
+
+        shift_x = export_anchor_x - current_anchor_x
+        shift_y = export_anchor_y - current_anchor_y
+
+        canvas.paste(img, (shift_x, shift_y), img)
         canvas.save(path)
 
         print(f"[UPDATED] {item['file']}")
