@@ -1,0 +1,198 @@
+import os
+import json
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+INPUT_IMAGE = "tiles.png"
+OUTPUT_DIR = "tiles_out"
+DEBUG_DIR = os.path.join(OUTPUT_DIR, "_debug")
+
+TILE_WIDTH = 512
+TILE_HEIGHT = 256
+
+MIN_TILE_AREA = 12000
+REPROCESS_ONLY = False  # 🔥 set True to skip detection
+
+# ============================================================
+# SETUP
+# ============================================================
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
+META_FILE = os.path.join(OUTPUT_DIR, "metadata.json")
+ANCHOR_OVERRIDE_FILE = os.path.join(OUTPUT_DIR, "anchors_override.json")
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def load_image():
+    img = cv2.imread(INPUT_IMAGE, cv2.IMREAD_UNCHANGED)
+    if img.shape[2] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    return img
+
+def get_mask(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+    _, mask = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return mask
+
+def find_tiles(mask):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return [c for c in contours if cv2.contourArea(c) > MIN_TILE_AREA]
+
+def estimate_anchor(mask):
+    h, w = mask.shape
+    for y in range(h - 1, 0, -1):
+        xs = np.where(mask[y] > 0)[0]
+        if len(xs) > 0:
+            return int((xs[0] + xs[-1]) / 2), y
+    return w // 2, h - 1
+
+# ============================================================
+# DETECTION + EXPORT
+# ============================================================
+
+def extract():
+    img = load_image()
+    mask = get_mask(img)
+    contours = find_tiles(mask)
+
+    metadata = []
+
+    for i, cnt in enumerate(contours):
+        x, y, w, h = cv2.boundingRect(cnt)
+
+        crop = img[y:y+h, x:x+w]
+        local_mask = np.zeros((h, w), dtype=np.uint8)
+
+        shifted = cnt.copy()
+        shifted[:, :, 0] -= x
+        shifted[:, :, 1] -= y
+
+        cv2.drawContours(local_mask, [shifted], -1, 255, -1)
+
+        anchor_x, anchor_y = estimate_anchor(local_mask)
+
+        canvas_h = max(420, h + 40)
+        canvas = Image.new("RGBA", (TILE_WIDTH, canvas_h), (0, 0, 0, 0))
+
+        tile_img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGRA2RGBA))
+        tile_img.putalpha(Image.fromarray(local_mask))
+
+        paste_x = (TILE_WIDTH // 2) - anchor_x
+        paste_y = TILE_HEIGHT - anchor_y
+
+        canvas.paste(tile_img, (paste_x, paste_y), tile_img)
+
+        name = f"object_{i:03d}.png"
+        path = os.path.join(OUTPUT_DIR, name)
+        canvas.save(path)
+
+        metadata.append({
+            "id": f"object_{i:03d}",
+            "file": name,
+            "bbox": [int(x), int(y), int(w), int(h)],
+            "anchor": [int(anchor_x), int(anchor_y)],
+            "paste": [int(paste_x), int(paste_y)]
+        })
+
+        print(f"[OK] {name}")
+
+    with open(META_FILE, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    # Create empty override file if not exists
+    if not os.path.exists(ANCHOR_OVERRIDE_FILE):
+        with open(ANCHOR_OVERRIDE_FILE, "w") as f:
+            json.dump({}, f, indent=2)
+
+    return metadata
+
+# ============================================================
+# REPROCESS WITH OVERRIDES
+# ============================================================
+
+def reprocess(metadata):
+    with open(ANCHOR_OVERRIDE_FILE) as f:
+        overrides = json.load(f)
+
+    for item in metadata:
+        img = Image.open(os.path.join(OUTPUT_DIR, item["file"])).convert("RGBA")
+
+        anchor_x, anchor_y = item["anchor"]
+
+        if item["id"] in overrides:
+            anchor_x = overrides[item["id"]]["anchor_x"]
+            anchor_y = overrides[item["id"]]["anchor_y"]
+
+        canvas_h = img.height
+        canvas = Image.new("RGBA", (TILE_WIDTH, canvas_h), (0, 0, 0, 0))
+
+        paste_x = (TILE_WIDTH // 2) - anchor_x
+        paste_y = TILE_HEIGHT - anchor_y
+
+        canvas.paste(img, (paste_x, paste_y), img)
+        canvas.save(os.path.join(OUTPUT_DIR, item["file"]))
+
+        print(f"[UPDATED] {item['file']}")
+
+# ============================================================
+# CONTACT SHEET
+# ============================================================
+
+def create_contact_sheet(metadata):
+    cols = 4
+    rows = int(np.ceil(len(metadata) / cols))
+
+    thumb_w = 256
+    thumb_h = 256
+
+    sheet = Image.new("RGBA", (cols * thumb_w, rows * thumb_h), (30, 30, 30, 255))
+    draw = ImageDraw.Draw(sheet)
+
+    for i, item in enumerate(metadata):
+        img = Image.open(os.path.join(OUTPUT_DIR, item["file"])).resize((thumb_w, thumb_h))
+
+        x = (i % cols) * thumb_w
+        y = (i // cols) * thumb_h
+
+        sheet.paste(img, (x, y), img)
+
+        # Draw index
+        draw.text((x + 5, y + 5), item["id"], fill=(255, 255, 0))
+
+        # Draw anchor (approx scaled)
+        ax = int((TILE_WIDTH // 2) * (thumb_w / TILE_WIDTH))
+        ay = int(TILE_HEIGHT * (thumb_h / img.height))
+
+        draw.line((x + ax - 5, y + ay, x + ax + 5, y + ay), fill="red", width=2)
+        draw.line((x + ax, y + ay - 5, x + ax, y + ay + 5), fill="red", width=2)
+
+    sheet.save(os.path.join(DEBUG_DIR, "contact_sheet.png"))
+    print("[INFO] Contact sheet generated")
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    if REPROCESS_ONLY:
+        with open(META_FILE) as f:
+            metadata = json.load(f)
+        reprocess(metadata)
+    else:
+        metadata = extract()
+
+    create_contact_sheet(metadata)
+
+    print("\nDONE")
