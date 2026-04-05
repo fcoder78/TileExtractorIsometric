@@ -20,8 +20,9 @@ REPROCESS_ONLY = False  # True = only apply anchor overrides to existing exports
 # Background / mask tuning
 BORDER_THICKNESS = 16
 BG_DISTANCE_THRESHOLD = 18
-MORPH_KERNEL_SIZE = 5
+MORPH_KERNEL_SIZE = 3
 MAX_COMPONENT_GAP_FILL = 3
+COMPONENT_PADDING = 16
 
 # Export tuning
 MIN_CANVAS_HEIGHT = 420
@@ -49,7 +50,7 @@ def ensure_rgba(img):
 
 def sample_border_pixels(img_bgr, border_thickness):
     h, w = img_bgr.shape[:2]
-    t = min(border_thickness, h // 4, w // 4)
+    t = min(border_thickness, max(1, h // 4), max(1, w // 4))
 
     top = img_bgr[:t, :, :].reshape(-1, 3)
     bottom = img_bgr[h - t:h, :, :].reshape(-1, 3)
@@ -83,9 +84,8 @@ def build_foreground_mask(img):
     mask = np.zeros(dist.shape, dtype=np.uint8)
     mask[dist >= BG_DISTANCE_THRESHOLD] = 255
 
-    # Morphological cleanup
+    # Less aggressive cleanup so thin details are preserved
     k = np.ones((MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
 
     # Small horizontal/vertical closing to reconnect tiny gaps
@@ -100,9 +100,12 @@ def build_foreground_mask(img):
 
 def find_components(mask):
     """
-    Return bounding boxes and masks for connected components larger than MIN_TILE_AREA.
+    Return padded bounding boxes and masks for connected components
+    larger than MIN_TILE_AREA.
+    Padding prevents tops/edges from getting clipped.
     """
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    img_h, img_w = mask.shape
 
     components = []
     for label in range(1, num_labels):
@@ -115,11 +118,21 @@ def find_components(mask):
         if area < MIN_TILE_AREA:
             continue
 
-        component_mask = np.zeros((h, w), dtype=np.uint8)
-        component_mask[labels[y:y + h, x:x + w] == label] = 255
+        # Expand bounding box
+        x0 = max(0, x - COMPONENT_PADDING)
+        y0 = max(0, y - COMPONENT_PADDING)
+        x1 = min(img_w, x + w + COMPONENT_PADDING)
+        y1 = min(img_h, y + h + COMPONENT_PADDING)
+
+        padded_w = x1 - x0
+        padded_h = y1 - y0
+
+        component_mask = np.zeros((padded_h, padded_w), dtype=np.uint8)
+        region = labels[y0:y1, x0:x1]
+        component_mask[region == label] = 255
 
         components.append({
-            "bbox": [x, y, w, h],
+            "bbox": [x0, y0, padded_w, padded_h],
             "area": area,
             "mask": component_mask
         })
@@ -134,7 +147,6 @@ def sort_components_reading_order(components):
     if not components:
         return components
 
-    # Estimate a row bucket based on average object height
     avg_h = int(np.mean([c["bbox"][3] for c in components]))
     row_bucket = max(80, avg_h // 2)
 
@@ -147,7 +159,6 @@ def sort_components_reading_order(components):
 def estimate_anchor(mask):
     """
     Estimate anchor as the lowest occupied row's horizontal center.
-    This is still heuristic, but far better once the mask is correct.
     """
     h, w = mask.shape
     for y in range(h - 1, -1, -1):
@@ -212,7 +223,6 @@ def create_contact_sheet(metadata, output_dir, debug_dir):
         sheet.paste(thumb, (x, y), thumb)
         draw.text((x + 6, y + 6), item["id"], fill=(255, 255, 0))
 
-        # Draw target anchor position, not estimated source anchor
         ax = THUMB_W // 2
         ay = int((TILE_HEIGHT / max(img.height, 1)) * THUMB_H)
 
@@ -271,7 +281,6 @@ def process_image(image_path):
         local_mask = comp["mask"]
 
         anchor_x, anchor_y = estimate_anchor(local_mask)
-
         tile_img = create_rgba_crop(img, comp["bbox"], local_mask)
 
         canvas_h = max(MIN_CANVAS_HEIGHT, h + EXTRA_CANVAS_PADDING)
