@@ -2,41 +2,24 @@ import os
 import json
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-INPUT_IMAGE = "tiles.png"
-OUTPUT_DIR = "tiles_out"
-DEBUG_DIR = os.path.join(OUTPUT_DIR, "_debug")
+INPUT_DIR = "input"
+OUTPUT_ROOT = "output"
 
 TILE_WIDTH = 512
 TILE_HEIGHT = 256
 
 MIN_TILE_AREA = 12000
-REPROCESS_ONLY = False  # 🔥 set True to skip detection
-
-# ============================================================
-# SETUP
-# ============================================================
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(DEBUG_DIR, exist_ok=True)
-
-META_FILE = os.path.join(OUTPUT_DIR, "metadata.json")
-ANCHOR_OVERRIDE_FILE = os.path.join(OUTPUT_DIR, "anchors_override.json")
+REPROCESS_ONLY = False  # 🔥 set True to only reprocess using overrides
 
 # ============================================================
 # HELPERS
 # ============================================================
-
-def load_image():
-    img = cv2.imread(INPUT_IMAGE, cv2.IMREAD_UNCHANGED)
-    if img.shape[2] == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
-    return img
 
 def get_mask(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
@@ -58,16 +41,52 @@ def estimate_anchor(mask):
     return w // 2, h - 1
 
 # ============================================================
-# DETECTION + EXPORT
+# CORE PROCESSING
 # ============================================================
 
-def extract():
-    img = load_image()
+def process_image(image_path):
+    image_name = os.path.splitext(os.path.basename(image_path))[0]
+
+    OUTPUT_DIR = os.path.join(OUTPUT_ROOT, image_name)
+    DEBUG_DIR = os.path.join(OUTPUT_DIR, "_debug")
+
+    META_FILE = os.path.join(OUTPUT_DIR, "metadata.json")
+    ANCHOR_OVERRIDE_FILE = os.path.join(OUTPUT_DIR, "anchors_override.json")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+
+    print(f"\n[PROCESSING] {image_name}")
+
+    if REPROCESS_ONLY and os.path.exists(META_FILE):
+        with open(META_FILE) as f:
+            metadata = json.load(f)
+        reprocess(metadata, OUTPUT_DIR, ANCHOR_OVERRIDE_FILE)
+        create_contact_sheet(metadata, OUTPUT_DIR, DEBUG_DIR)
+        return
+
+    # =========================
+    # LOAD IMAGE
+    # =========================
+    img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        print(f"[ERROR] Failed to load {image_path}")
+        return
+
+    if img.shape[2] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+
+    # =========================
+    # DETECT TILES
+    # =========================
     mask = get_mask(img)
     contours = find_tiles(mask)
 
     metadata = []
 
+    # =========================
+    # PROCESS EACH TILE
+    # =========================
     for i, cnt in enumerate(contours):
         x, y, w, h = cv2.boundingRect(cnt)
 
@@ -94,8 +113,7 @@ def extract():
         canvas.paste(tile_img, (paste_x, paste_y), tile_img)
 
         name = f"object_{i:03d}.png"
-        path = os.path.join(OUTPUT_DIR, name)
-        canvas.save(path)
+        canvas.save(os.path.join(OUTPUT_DIR, name))
 
         metadata.append({
             "id": f"object_{i:03d}",
@@ -107,26 +125,32 @@ def extract():
 
         print(f"[OK] {name}")
 
+    # =========================
+    # SAVE METADATA
+    # =========================
     with open(META_FILE, "w") as f:
         json.dump(metadata, f, indent=2)
 
-    # Create empty override file if not exists
     if not os.path.exists(ANCHOR_OVERRIDE_FILE):
         with open(ANCHOR_OVERRIDE_FILE, "w") as f:
             json.dump({}, f, indent=2)
 
-    return metadata
+    create_contact_sheet(metadata, OUTPUT_DIR, DEBUG_DIR)
+
+    print(f"[DONE] {image_name}")
+
 
 # ============================================================
-# REPROCESS WITH OVERRIDES
+# REPROCESS (WITH OVERRIDES)
 # ============================================================
 
-def reprocess(metadata):
+def reprocess(metadata, OUTPUT_DIR, ANCHOR_OVERRIDE_FILE):
     with open(ANCHOR_OVERRIDE_FILE) as f:
         overrides = json.load(f)
 
     for item in metadata:
-        img = Image.open(os.path.join(OUTPUT_DIR, item["file"])).convert("RGBA")
+        path = os.path.join(OUTPUT_DIR, item["file"])
+        img = Image.open(path).convert("RGBA")
 
         anchor_x, anchor_y = item["anchor"]
 
@@ -134,22 +158,22 @@ def reprocess(metadata):
             anchor_x = overrides[item["id"]]["anchor_x"]
             anchor_y = overrides[item["id"]]["anchor_y"]
 
-        canvas_h = img.height
-        canvas = Image.new("RGBA", (TILE_WIDTH, canvas_h), (0, 0, 0, 0))
+        canvas = Image.new("RGBA", (TILE_WIDTH, img.height), (0, 0, 0, 0))
 
         paste_x = (TILE_WIDTH // 2) - anchor_x
         paste_y = TILE_HEIGHT - anchor_y
 
         canvas.paste(img, (paste_x, paste_y), img)
-        canvas.save(os.path.join(OUTPUT_DIR, item["file"]))
+        canvas.save(path)
 
         print(f"[UPDATED] {item['file']}")
+
 
 # ============================================================
 # CONTACT SHEET
 # ============================================================
 
-def create_contact_sheet(metadata):
+def create_contact_sheet(metadata, OUTPUT_DIR, DEBUG_DIR):
     cols = 4
     rows = int(np.ceil(len(metadata) / cols))
 
@@ -167,12 +191,10 @@ def create_contact_sheet(metadata):
 
         sheet.paste(img, (x, y), img)
 
-        # Draw index
         draw.text((x + 5, y + 5), item["id"], fill=(255, 255, 0))
 
-        # Draw anchor (approx scaled)
-        ax = int((TILE_WIDTH // 2) * (thumb_w / TILE_WIDTH))
-        ay = int(TILE_HEIGHT * (thumb_h / img.height))
+        ax = thumb_w // 2
+        ay = int((TILE_HEIGHT / img.height) * thumb_h)
 
         draw.line((x + ax - 5, y + ay, x + ax + 5, y + ay), fill="red", width=2)
         draw.line((x + ax, y + ay - 5, x + ax, y + ay + 5), fill="red", width=2)
@@ -180,19 +202,28 @@ def create_contact_sheet(metadata):
     sheet.save(os.path.join(DEBUG_DIR, "contact_sheet.png"))
     print("[INFO] Contact sheet generated")
 
+
 # ============================================================
 # MAIN
 # ============================================================
 
+def main():
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
+
+    files = [
+        f for f in os.listdir(INPUT_DIR)
+        if f.lower().endswith((".png", ".jpg", ".jpeg"))
+    ]
+
+    if not files:
+        print("[ERROR] No images found in input/")
+        return
+
+    for file in files:
+        process_image(os.path.join(INPUT_DIR, file))
+
+    print("\nALL DONE")
+
+
 if __name__ == "__main__":
-
-    if REPROCESS_ONLY:
-        with open(META_FILE) as f:
-            metadata = json.load(f)
-        reprocess(metadata)
-    else:
-        metadata = extract()
-
-    create_contact_sheet(metadata)
-
-    print("\nDONE")
+    main()
