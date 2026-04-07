@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw
 INPUT_DIR = "input"
 OUTPUT_ROOT = "output"
 
-# Logical isometric tile size used by your engine math
+# Full sprite image size (must be exact for every final export)
 TILE_WIDTH = 512
 TILE_HEIGHT = 256
 
@@ -23,13 +23,15 @@ BORDER_THICKNESS = 16
 BG_DISTANCE_THRESHOLD = 18
 MORPH_KERNEL_SIZE = 3
 MAX_COMPONENT_GAP_FILL = 3
-COMPONENT_PADDING = 24
+COMPONENT_PADDING = 16
 
 # Export tuning
+# Anchor must stay inside the final 512x256 canvas
 EXPORT_ANCHOR_X = TILE_WIDTH // 2
-EXPORT_ANCHOR_Y = 340   # IMPORTANT: lower than TILE_HEIGHT to preserve tall tops
-MIN_CANVAS_HEIGHT = 420
-EXTRA_CANVAS_PADDING = 40
+EXPORT_ANCHOR_Y = TILE_HEIGHT - 1  # bottom-center anchor
+
+FIXED_CANVAS_WIDTH = TILE_WIDTH
+FIXED_CANVAS_HEIGHT = TILE_HEIGHT
 
 # Contact sheet
 CONTACT_SHEET_COLS = 4
@@ -191,31 +193,50 @@ def create_rgba_crop(img, bbox, local_mask):
     return pil_img
 
 
-def normalize_tile_to_canvas(tile_img, local_mask, anchor_x, anchor_y):
+def check_tile_fits_canvas(local_mask, anchor_x, anchor_y):
     """
-    Build a canvas that guarantees no clipping above or below the anchor.
+    Check whether the extracted object fits fully inside the final fixed canvas
+    when placed at the export anchor.
     """
     h, w = local_mask.shape
 
-    above_anchor = anchor_y
-    below_anchor = h - anchor_y - 1
+    left = anchor_x
+    right = w - anchor_x - 1
+    above = anchor_y
+    below = h - anchor_y - 1
 
-    required_top = max(EXPORT_ANCHOR_Y, above_anchor + EXTRA_CANVAS_PADDING)
-    required_bottom = max(0, below_anchor + EXTRA_CANVAS_PADDING)
-
-    canvas_h = max(
-        MIN_CANVAS_HEIGHT,
-        required_top + required_bottom + 1
+    fits_horizontally = (
+        left <= EXPORT_ANCHOR_X and
+        right <= (FIXED_CANVAS_WIDTH - EXPORT_ANCHOR_X - 1)
+    )
+    fits_vertically = (
+        above <= EXPORT_ANCHOR_Y and
+        below <= (FIXED_CANVAS_HEIGHT - EXPORT_ANCHOR_Y - 1)
     )
 
-    # Actual anchor location inside exported PNG
+    return fits_horizontally and fits_vertically, {
+        "left": int(left),
+        "right": int(right),
+        "above": int(above),
+        "below": int(below),
+    }
+
+
+def normalize_tile_to_canvas(tile_img, local_mask, anchor_x, anchor_y):
+    """
+    Normalize every object to the exact same final canvas size.
+    Every exported PNG will be exactly 512x256.
+    """
+    canvas_w = FIXED_CANVAS_WIDTH
+    canvas_h = FIXED_CANVAS_HEIGHT
+
     anchor_in_canvas_x = EXPORT_ANCHOR_X
-    anchor_in_canvas_y = required_top
+    anchor_in_canvas_y = EXPORT_ANCHOR_Y
 
     paste_x = anchor_in_canvas_x - anchor_x
     paste_y = anchor_in_canvas_y - anchor_y
 
-    canvas = Image.new("RGBA", (TILE_WIDTH, canvas_h), (0, 0, 0, 0))
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
     canvas.paste(tile_img, (paste_x, paste_y), tile_img)
 
     return canvas, paste_x, paste_y, anchor_in_canvas_x, anchor_in_canvas_y
@@ -283,7 +304,7 @@ def process_image(image_path):
     if REPROCESS_ONLY and os.path.exists(meta_file):
         with open(meta_file, "r", encoding="utf-8") as f:
             metadata = json.load(f)
-        reprocess(metadata, output_dir, anchor_override_file)
+        reprocess(metadata, output_dir, anchor_override_file, meta_file)
         create_contact_sheet(metadata, output_dir, debug_dir)
         return
 
@@ -312,6 +333,13 @@ def process_image(image_path):
         anchor_x, anchor_y = estimate_anchor(local_mask)
         tile_img = create_rgba_crop(img, comp["bbox"], local_mask)
 
+        fits, extents = check_tile_fits_canvas(local_mask, anchor_x, anchor_y)
+        if not fits:
+            print(
+                f"[WARNING] object_{i:03d} may be clipped in {FIXED_CANVAS_WIDTH}x{FIXED_CANVAS_HEIGHT}. "
+                f"Extents={extents}, export_anchor=({EXPORT_ANCHOR_X}, {EXPORT_ANCHOR_Y})"
+            )
+
         canvas, paste_x, paste_y, export_anchor_x, export_anchor_y = normalize_tile_to_canvas(
             tile_img, local_mask, anchor_x, anchor_y
         )
@@ -328,12 +356,16 @@ def process_image(image_path):
             "source_anchor": [int(anchor_x), int(anchor_y)],
             "paste": [int(paste_x), int(paste_y)],
             "export_anchor": [int(export_anchor_x), int(export_anchor_y)],
-            "logical_tile_size": [int(TILE_WIDTH), int(TILE_HEIGHT)]
+            "logical_tile_size": [int(TILE_WIDTH), int(TILE_HEIGHT)],
+            "export_size": [int(FIXED_CANVAS_WIDTH), int(FIXED_CANVAS_HEIGHT)],
+            "fits_fixed_canvas": bool(fits),
+            "extents_from_anchor": extents
         })
 
         print(
             f"[OK] {name} bbox=({x}, {y}, {w}, {h}) "
-            f"area={comp['area']} export_anchor=({export_anchor_x}, {export_anchor_y})"
+            f"area={comp['area']} export_size=({FIXED_CANVAS_WIDTH}, {FIXED_CANVAS_HEIGHT}) "
+            f"export_anchor=({export_anchor_x}, {export_anchor_y})"
         )
 
     with open(meta_file, "w", encoding="utf-8") as f:
@@ -351,7 +383,7 @@ def process_image(image_path):
 # REPROCESS (WITH OVERRIDES)
 # ============================================================
 
-def reprocess(metadata, output_dir, anchor_override_file):
+def reprocess(metadata, output_dir, anchor_override_file, meta_file):
     if os.path.exists(anchor_override_file):
         with open(anchor_override_file, "r", encoding="utf-8") as f:
             overrides = json.load(f)
@@ -365,31 +397,36 @@ def reprocess(metadata, output_dir, anchor_override_file):
 
         img = Image.open(path).convert("RGBA")
 
-        export_anchor_x, export_anchor_y = item.get(
+        old_anchor_x, old_anchor_y = item.get(
             "export_anchor",
             [EXPORT_ANCHOR_X, EXPORT_ANCHOR_Y]
         )
 
+        export_anchor_x = old_anchor_x
+        export_anchor_y = old_anchor_y
+
         if item["id"] in overrides:
-            export_anchor_x = overrides[item["id"]].get("anchor_x", export_anchor_x)
-            export_anchor_y = overrides[item["id"]].get("anchor_y", export_anchor_y)
+            export_anchor_x = overrides[item["id"]].get("anchor_x", old_anchor_x)
+            export_anchor_y = overrides[item["id"]].get("anchor_y", old_anchor_y)
 
-        item["export_anchor"] = [int(export_anchor_x), int(export_anchor_y)]
+        shift_x = export_anchor_x - old_anchor_x
+        shift_y = export_anchor_y - old_anchor_y
 
-        img_w, img_h = img.size
-        new_canvas_h = max(img_h, export_anchor_y + EXTRA_CANVAS_PADDING)
-        canvas = Image.new("RGBA", (TILE_WIDTH, new_canvas_h), (0, 0, 0, 0))
-
-        current_anchor_x = item.get("export_anchor", [EXPORT_ANCHOR_X, EXPORT_ANCHOR_Y])[0]
-        current_anchor_y = item.get("export_anchor", [EXPORT_ANCHOR_X, EXPORT_ANCHOR_Y])[1]
-
-        shift_x = export_anchor_x - current_anchor_x
-        shift_y = export_anchor_y - current_anchor_y
-
+        canvas = Image.new(
+            "RGBA",
+            (FIXED_CANVAS_WIDTH, FIXED_CANVAS_HEIGHT),
+            (0, 0, 0, 0)
+        )
         canvas.paste(img, (shift_x, shift_y), img)
         canvas.save(path)
 
+        item["export_anchor"] = [int(export_anchor_x), int(export_anchor_y)]
+        item["export_size"] = [int(FIXED_CANVAS_WIDTH), int(FIXED_CANVAS_HEIGHT)]
+
         print(f"[UPDATED] {item['file']}")
+
+    with open(meta_file, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
 
 # ============================================================
